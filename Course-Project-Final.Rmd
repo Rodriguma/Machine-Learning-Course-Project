@@ -1,0 +1,324 @@
+---
+title: "Qualitative activity recognition"
+author: "Marta.R"
+date: "23 de enero de 2016"
+output: html_document
+---
+
+## SUMMARY
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit makes now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+**In this project, the course-project for the Practical Machine Learning" course at coursera, our goal will be to use data from UMIT (Project description says only accelerometers, but I guess we should also include gyroscope and magnetometer) on the belt, forearm, arm, and dumbbell of 6 participants to predict how well the exercise is done.**
+
+The original study and addittional information are available from the website: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+## THE QUESTION
+The question we want to address; **is it possible to predict how well barbell lifts are done from the information of four sensors in the belt, forearm, arm, and dumbbell of the person doing the exercise?**
+
+We will see through this report we are going to be able to train a model to get the accurate predictions needed for the quiz, as we have records of all the people we intend to predict about. 
+However, as indicated in the original report, our classifier/model trained for some people/subjects isn't very useful for predicting a new subject, we will check this behaviour in the [Appendix](#id1) of this report. 
+
+```{r, echo=FALSE,results='hide',warning=FALSE, message=FALSE}
+library(caret);library(randomForest);library(gbm);library(ipred);library(plyr);library(e1071);library(rpart);library(doSNOW);library(lubridate);library(knitr)
+```
+## THE DATA
+Six participants in the experiment were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in 5 different ways: according to the specification (Class A) and with four different common mistakes (Class B, C, D & E). The data we will work on was recorded from four sensors on the belt, forearm, arm, and dumbbell of 6 participants. These sensors provided three-axes acceleration, gyroscope and magnetometer data.
+
+The training data is available in http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv , and the data to predict in http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv.
+
+To start the study we will download the data and load it in to R. 
+
+```{r,results='hide', warning=FALSE}
+## getting the data and reading it in R
+OrigData_URL<-"http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+predictions_URL<-"http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+if(!file.exists("./Data")) {dir.create("./Data")}
+if(!file.exists("./Data/pml-training.csv")) {
+download.file(OrigData_URL,destfile = "./Data/pml-training.csv")}
+if(!file.exists("./Data/pml-testing.csv")) {
+download.file(predictions_URL,destfile = "./Data/pml-testing.csv")}
+OrigData<-read.csv("./Data/pml-training.csv",na.strings=c("NA","#DIV/0!",""))
+predictions<-read.csv("./Data/pml-testing.csv",na.strings=c("NA","#DIV/0!",""))
+```
+The data we get from the file is not the original measurements from the sensors, in fact it contains some of the transformations of the original experiments that could lead us to the final results doing nothing; all the records with the same value in the num_window column will have the same classification. 
+So to go ahead with the study we will remove the seven first columns and the columns that have NA's in all the rows with new_window=="no" (this columns contain the mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness, generating in total 96 derived feature sets, for the Euler angles of each of the four sensors by window).
+
+```{r,results='hide', warning=FALSE}
+##cleaning the data
+which(sapply(OrigData[OrigData$new_window=="no",], function(x)all(is.na(x))))->quitarcolumn
+OrigData[,-quitarcolumn]->OrigData1
+OrigData1[,8:length(OrigData1)]->OrigData1
+predictions[,-quitarcolumn]->predictions1
+predictions1[,8:length(predictions1)]->predictions1
+predictions1->predictions2
+```
+
+Now we will split our dataset into the training and test sets to go ahead with features and model selection. 
+```{r,results='hide', warning=FALSE}
+## Creating training and test subsets
+set.seed(1974)
+inTrain = createDataPartition(OrigData1$classe, p = 0.6, list = FALSE)
+training = OrigData1[ inTrain,]
+testing = OrigData1[-inTrain,]
+```
+From now on we will only work with training set until the validation phase when we will calculate the out of sample error in the test set.
+
+## FEATURES
+I am not an expert in Kinematics, but looking at the information in the original report it seems that from the initial measurements they calculated Euler Angles for the four sensors. The Euler angles are rotational coordinates to describe the orientation of a rigid body (to get Euler angles we have to use specific nonlinear transformations of the measurements). So I think it is a good start to use the Euler angles as our features to train the algorithms.  
+
+These Euler angles are recorded in columns named "euler_angle"_"sensor_position", where possible "euler_angle" are roll, pitch or yaw and possible "Sensor_position" are belt, arm, dumbbell or forearm. So I will subset the data to get just those 12 columns plus the classe one.
+
+```{r,results='hide', warning=FALSE}
+grep("yaw|pitch|roll",names(training))->selectcolumn
+c(selectcolumn,53)->selectcolumn
+training[,selectcolumn]->training2
+testing[,selectcolumn]->testing2
+predictions1[,selectcolumn]->predictions1
+```
+## ALGORITHM
+Now we have chosen the features we think more suitable, we will train different algorithms to compare them and select the best for our predictions. 
+I will start from the simplest one, a Classification tree algorithm, then I will train a Bagging Classification tree, later a Radom forest and finally a Gradient Boosting Algorithm. 
+We will implement cross validation for all of them using 8 K-folds to try to avoid overfitting. 
+
+First we will set the train control options so that all the algorithms trained later use cross validation with 5 K-folds.
+
+```{r}
+trainControl(method="cv", number=8)->TCTR
+```
+
+And now we will train each algorithm according to the options below.
+
+### Classification Tree
+
+```{r, echo=FALSE}
+## Training a tree algorithm with cross validation (8 K-fold)
+if(!file.exists("./ModeltreeCV12.RData")) {
+set.seed(2001)
+ModeltreeCV<-train(classe~.,data=training2,method="rpart",
+              trControl=TCTR) 
+save(ModeltreeCV, file="ModeltreeCV12.RData")
+}else{
+  load("./ModeltreeCV12.RData")}
+ModeltreeCV$call
+```
+
+### Classification Tree with Bagging
+
+```{r, echo=FALSE}
+## Training a tree algorithm with Bagging and cross validation (8 K-fold)
+if(!file.exists("./ModeltreeBAGCV12.RData")) {
+set.seed(2001)
+ModeltreeBAGCV<-train(classe~.,data=training2,method="treebag",
+              trControl=TCTR)  
+save(ModeltreeBAGCV, file="ModeltreeBAGCV12.RData")
+}else{load("./ModeltreeBAGCV12.RData")}
+ModeltreeBAGCV$call
+```
+
+### Random Forest (500 trees)
+
+```{r, echo=FALSE}
+## Training a Random Forest algorithm with cross validation (8 K-fold)
+
+if(!file.exists("./ModelRFCV12.RData")) {
+set.seed(2001)
+ModelRFCV<-train(classe~.,data=training2,method="rf",
+              trControl=TCTR) 
+save(ModelRFCV, file="ModelRFCV12.RData")
+}else{load("./ModelRFCV12.RData")}
+ModelRFCV$call
+```
+
+### Gradient Boosting 
+
+```{r, echo=FALSE}
+## Training a Gradient Boosting algorithm with cross validation (8 K-fold)
+if(!file.exists("./ModelGBMCV12.RData")) {
+set.seed(2001)
+ModelGBMCV<-train(classe~.,data=training2,method="gbm",verbose=FALSE,
+              trControl=TCTR) 
+save(ModelGBMCV, file="ModelGBMCV12.RData")
+}else{load("./ModelGBMCV12.RData")}
+ModelGBMCV$call
+```
+
+## VALIDATION
+Now we will calculate accuracy and error rates (out and in sample) for the different models to compare the results;  
+```{r}
+methods<-list(ModeltreeCV,ModeltreeBAGCV,ModelRFCV,ModelGBMCV)
+predict(methods, newdata=testing2)-> tests
+predict(methods, newdata=training2)-> tests2
+createMatrix <- function(x) {
+  confusionMatrix(x,testing2$classe)
+}
+createMatrix2 <- function(x) {
+  confusionMatrix(x,training2$classe)
+}
+lapply(tests,createMatrix)->confusions
+lapply(tests2,createMatrix2)->confusions2
+```
+
+Now here we have the different results we got from all the algorithms.
+
+```{r, echo=FALSE}
+## Store the information in the Dataframe "Results"
+Results<-data.frame(matrix(NA, nrow = 4, ncol = 6))
+names(Results)<-c("Algorithm", 
+              "Accuracy in training Sample","In Sample error" ,
+              "Accuracy in testing Sample",
+              "Out of Sample error", 
+              "Time to train the Model" 
+              )
+
+for (i in 1:length(methods)) {
+  methods[[i]]$modelInfo$label->Results[i,1]
+  sprintf("%1.2f%%", 100*confusions2[[i]]$overall[[1]])->Results[i,2]
+  sprintf("%1.2f%%",100*(1-confusions2[[i]]$overall[[1]]))->Results[i,3]
+  sprintf("%1.2f%%", 100*confusions[[i]]$overall[[1]])->Results[i,4]
+  sprintf("%1.2f%%",100*(1-confusions[[i]]$overall[[1]]))->Results[i,5]
+  as.character(seconds_to_period(round(methods[[i]]$times$everything[[3]],0)))->Results[i,6]
+  ##seconds_to_period(round(Results[i,6],0))[1]->Results[i,6]
+    }
+kable(Results)
+remove(methods)
+```
+
+## CONCLUSIONS
+From the information in the previous table the most accurate model is Random Forest, however "Classification trees with Bagging Algorithm" is performing quite well, its accuracy is near to RF's and the time needed to train the algorithm is half the time needed to train RF. It is also true that the file generated after saving the Bagging method is ten times the size of the RF's one.
+As my PC is an old one with a slow two-cores CPU and 2 GB of memory, and time is quite important, I will select the second algorithm, just in case I got more data to train :). 
+
+## Final prediction of the 20 records in "pml-testing"
+
+Now we will predict the class of the records in pml-testing file, using the model we selected in the previous Step,**"Classification trees with Bagging Algorithm"**
+
+```{r, echo=FALSE}
+predict(ModeltreeBAGCV,newdata=predictions1)->P
+paste("R",1:20, sep = ".")->names(P)
+kable(t(as.data.frame(P)), row.names=FALSE)
+``` 
+
+Double checking the results we get the predictions are equal using Random Forest Algorithm.
+```{r, echo=FALSE}
+predict(ModelRFCV,newdata=predictions1)->P
+paste("R",1:20, sep = ".")->names(P)
+kable(t(as.data.frame(P)), row.names=FALSE)
+``` 
+
+Predictions have some differences in the other models.
+
+```{r, echo=FALSE}
+print("Classification Tree Algorithm")
+predict(ModeltreeCV,newdata=predictions1)->P
+paste("R",1:20, sep = ".")->names(P)
+kable(t(as.data.frame(P)), row.names=FALSE)
+print("Gradient Boosting Algorithm")
+predict(ModelGBMCV,newdata=predictions1)->P
+paste("R",1:20, sep = ".")->names(P)
+kable(t(as.data.frame(P)), row.names=FALSE)
+``` 
+
+## APPENDIX
+
+<a id="id1"></a>
+
+### Leaving one subject out of the training set.
+
+As we said before the classifier we trained is very accurate for predicting the exercise of people whose data is used to train the algorithm. However it is not very useful for predicting new people's exercise.
+
+The original study suggest the use of this approach requires a lot of data from more subjects, in order to reach a result that can be generalized for a new user without the need of training the classifier. So this is another good reason to select Bagging against Random Forest, as Bagging needs less computing resources.
+
+Below you can find the results obtained training the best two algorithms leaving one subject OUT of the training set. As you can see overall recognition performance (out of sample accuracy) is quite poor, no matter who you leave out or the algorithm you use. 
+
+```{r, echo=FALSE,warning=FALSE,message=FALSE, results='hide'}
+
+cbind(OrigData$user_name,OrigData1)->OrigData2
+
+levels(OrigData2[,1])->Subjects
+vector("list",length(Subjects))->resultados
+names(resultados)<-Subjects
+for(name in Subjects){
+
+## Creating the training and test sets leaving the selected subject out of the training set
+training<-paste("training",name,sep = "_")
+testing<-paste("test",name,sep = "_")
+assign(training,OrigData2[OrigData2[1]!=name,])
+assign(testing,OrigData2[OrigData2[1]==name,])
+
+## Selecting features
+grep("yaw|pitch|roll",names(get(training)))->selectcolumn
+c(selectcolumn,54)->selectcolumn
+assign(training,get(training)[,selectcolumn])
+assign(testing,get(testing)[,selectcolumn])
+
+## Setting cross validation
+trainControl(method="cv", number=8)->TCTR
+
+## training the models TreeBag & Random Forest
+methods<-vector("list", 2)
+i<-1
+for (method in c("rf","treebag")){
+  paste("Model",method,name,sep = "")->Model
+  file<-paste((paste("Model",method,name,sep = "")),"RData",sep = ".")
+ if(!file.exists(file)){ 
+  set.seed(2001)
+  assign(Model,train(classe~.,data=get(training),method=method,trControl=TCTR))
+  save(list=Model, file=file)
+ }else{load(file)}
+  methods[[i]]<-get(Model)
+  i<-i+1
+  remove(list=Model)
+  }
+
+## Predicting the test set and the confusion MatriX
+paste("tests",name,sep = "_")->tests
+paste("tests2",name,sep = "_")->tests2
+assign(tests,predict(methods, newdata=get(testing)))
+assign(tests2,predict(methods, newdata=get(training)))
+createMatrix <- function(x) {
+  confusionMatrix(x,get(testing)$classe)
+}
+
+createMatrix2 <- function(x) {
+  confusionMatrix(x,get(training)$classe)
+}
+paste("confusions",name,sep = "_")->confusions
+paste("confusions2",name,sep = "_")->confusions2
+assign(confusions,lapply(get(tests),createMatrix))
+assign(confusions2,lapply(get(tests2),createMatrix2))
+
+
+## Store the information in the List "Results"
+paste("Results",name,sep = "_")->Results
+assign(Results,data.frame(matrix(NA, nrow = length(methods), ncol = 7)))
+list(get(Results))->resultados[name]
+
+for (i in 1:length(methods)) {
+  name->resultados[[name]][i,1]
+  methods[[i]]$modelInfo$label->resultados[[name]][i,2]
+  sprintf("%1.2f%%", 100*get(confusions2)[[i]]$overall[[1]])->resultados[[name]][i,3]
+  sprintf("%1.2f%%",100*(1-get(confusions2)[[i]]$overall[[1]]))->resultados[[name]][i,4]
+  sprintf("%1.2f%%", 100*get(confusions)[[i]]$overall[[1]])->resultados[[name]][i,5]
+  sprintf("%1.2f%%",100*(1-get(confusions)[[i]]$overall[[1]]))->resultados[[name]][i,6]
+  as.character(seconds_to_period(round(methods[[i]]$times$everything[[3]],0)))->resultados[[name]][i,7]
+    }
+remove(methods)
+}
+```
+
+```{r, echo=FALSE, warning=FALSE}
+Final<-data.frame(matrix(NA, nrow = 0, ncol = 7))
+for(name in Subjects){
+rbind(Final,resultados[[name]])->Final
+}
+names(Final)<-c("subject left Out","Algorithm", 
+              "Accuracy in training Sample","In Sample error",
+              "Accuracy in testing Sample",
+              "Out of Sample error", 
+              "Time to train the Model" 
+              )
+kable(Final)
+```
+
+### NOTES
+Training each model in this report takes quite long, so all the algorithms trained in this report are saved in files available in the github repo. The markdown file checks the existence of these files before starting to train the algorithm.
+All the code is available in the associated Rmd file in the Github Repo. 
